@@ -6,12 +6,18 @@ This is where syntax becomes MEANING.
 Pratt parsing meets recursive descent meets PURE INNOVATION.
 """
 
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, List, Union
 from dataclasses import dataclass
+from io import StringIO
 
-from .tokens import Token, TokenType, PRECEDENCE, RIGHT_ASSOCIATIVE, get_precedence
-from .lexer import Lexer, LexerError
-from .ast_nodes import *
+try:
+    from .tokens import Token, TokenType, PRECEDENCE, RIGHT_ASSOCIATIVE, get_precedence
+    from .lexer import Lexer, LexerError
+    from .ast_nodes import *
+except ImportError:
+    from tokens import Token, TokenType, PRECEDENCE, RIGHT_ASSOCIATIVE, get_precedence
+    from lexer import Lexer, LexerError
+    from ast_nodes import *
 
 
 class ParseError(Exception):
@@ -20,6 +26,14 @@ class ParseError(Exception):
         self.message = message
         self.token = token
         super().__init__(f"{token.location}: {message}")
+
+
+class ParseErrorCollection(Exception):
+    """Collection of parse errors for batch reporting."""
+    def __init__(self, errors: List[ParseError]):
+        self.errors = errors
+        messages = [str(e) for e in errors]
+        super().__init__(f"Found {len(errors)} parse errors:\n" + "\n".join(messages))
 
 
 class Parser:
@@ -36,6 +50,8 @@ class Parser:
         self.lexer = Lexer(source, filename)
         self.current: Optional[Token] = None
         self.previous: Optional[Token] = None
+        self.errors: List[ParseError] = []
+        self.panic_mode: bool = False
         self._advance()
         
         # Prefix parsers (for literals, identifiers, unary ops, etc.)
@@ -65,6 +81,8 @@ class Parser:
             TokenType.OK: self.parse_ok,
             TokenType.ERR: self.parse_err,
             TokenType.LT: self.parse_jsx,
+            TokenType.SELF: self.parse_self,
+            TokenType.SELF_TYPE: self.parse_self_type,
         }
         
         # Infix parsers (for binary ops)
@@ -111,6 +129,7 @@ class Parser:
             TokenType.STAR_ASSIGN: self.parse_compound_assign,
             TokenType.SLASH_ASSIGN: self.parse_compound_assign,
             TokenType.PERCENT_ASSIGN: self.parse_compound_assign,
+            TokenType.IS: self.parse_is_expr,
         }
     
     # === UTILITY METHODS ===
@@ -134,10 +153,18 @@ class Parser:
             return self._advance()
         return None
     
-    def _expect(self, token_type: TokenType, message: str = None) -> Token:
-        """Expect a specific token type, raise error if not found."""
-        if not self._check(token_type):
-            msg = message or f"Expected {token_type.name}, got {self.current.type.name}"
+    def _expect(self, *token_types: TokenType, message: str = None) -> Token:
+        """
+        Expect one of the given token types, raise error if not found.
+        
+        FIXED: Now properly accepts multiple token types!
+        """
+        if not self._check(*token_types):
+            if len(token_types) == 1:
+                expected = token_types[0].name
+            else:
+                expected = " or ".join(t.name for t in token_types)
+            msg = message or f"Expected {expected}, got {self.current.type.name}"
             raise ParseError(msg, self.current)
         return self._advance()
     
@@ -145,8 +172,15 @@ class Parser:
         """Create a parse error at current position."""
         return ParseError(message, self.current)
     
+    def _report_error(self, error: ParseError):
+        """Report an error without immediately raising it."""
+        if not self.panic_mode:
+            self.errors.append(error)
+            self.panic_mode = True
+    
     def _sync(self):
         """Synchronize after error to continue parsing."""
+        self.panic_mode = False
         self._advance()
         while not self._check(TokenType.EOF):
             if self.previous.type == TokenType.SEMICOLON:
@@ -154,7 +188,8 @@ class Parser:
             if self._check(TokenType.FN, TokenType.LET, TokenType.VAR,
                           TokenType.STRUCT, TokenType.ENUM, TokenType.TRAIT,
                           TokenType.IMPL, TokenType.IF, TokenType.FOR,
-                          TokenType.WHILE, TokenType.RETURN):
+                          TokenType.WHILE, TokenType.RETURN, TokenType.COMPONENT,
+                          TokenType.MODULE, TokenType.USE, TokenType.PUB):
                 return
             self._advance()
     
@@ -162,6 +197,10 @@ class Parser:
         """Skip any newline tokens."""
         while self._check(TokenType.NEWLINE):
             self._advance()
+    
+    def _peek_is(self, *types: TokenType) -> bool:
+        """Check if the NEXT token (after current) is one of the given types."""
+        return self.lexer.peek().type in types
     
     # === EXPRESSION PARSING (Pratt Parser) ===
     
@@ -242,13 +281,23 @@ class Parser:
         token = self._advance()
         return NoneLiteral(location=token.location)
     
+    def parse_self(self) -> Identifier:
+        """Parse self keyword."""
+        token = self._advance()
+        return Identifier(name="self", location=token.location)
+    
+    def parse_self_type(self) -> Identifier:
+        """Parse Self type keyword."""
+        token = self._advance()
+        return Identifier(name="Self", location=token.location)
+    
     def parse_identifier(self) -> Expression:
         """Parse identifier or qualified name."""
         token = self._advance()
         name = Identifier(name=token.value, location=token.location)
         
-        # Check for qualified name
-        if self._check(TokenType.TRAIT_IMPL):
+        # Check for qualified name (but not after a call/index)
+        if self._check(TokenType.TRAIT_IMPL) and not self._peek_is(TokenType.LPAREN, TokenType.LBRACKET):
             parts = [token.value]
             while self._match(TokenType.TRAIT_IMPL):
                 next_tok = self._expect(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER)
@@ -458,13 +507,29 @@ class Parser:
         )
     
     def parse_lambda(self) -> Lambda:
-        """Parse lambda: fn(x) => x * 2 or |x| x * 2."""
+        """Parse lambda: fn(x) => x * 2 or fn(x) { body }."""
         start = self._advance()  # fn
         
         params = self.parse_parameter_list()
         
-        self._expect(TokenType.ARROW)
-        body = self.parse_expression()
+        # Return type annotation (optional)
+        return_type = None
+        if self._match(TokenType.FLOW):
+            # Check if it's a return type or expression body
+            if self._check(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER, 
+                          TokenType.LPAREN, TokenType.LBRACKET, TokenType.FN):
+                return_type = self.parse_type()
+        
+        # Body can be => expr or { block }
+        if self._match(TokenType.ARROW):
+            body = self.parse_expression()
+        elif self._check(TokenType.LBRACE):
+            self._advance()
+            body = self.parse_block_body(self.previous)
+        else:
+            # Just => expr syntax
+            self._expect(TokenType.ARROW)
+            body = self.parse_expression()
         
         return Lambda(
             params=params,
@@ -478,8 +543,15 @@ class Parser:
         self._expect(TokenType.FN)
         
         params = self.parse_parameter_list()
-        self._expect(TokenType.ARROW)
-        body = self.parse_expression()
+        
+        if self._match(TokenType.ARROW):
+            body = self.parse_expression()
+        elif self._check(TokenType.LBRACE):
+            self._advance()
+            body = self.parse_block_body(self.previous)
+        else:
+            self._expect(TokenType.ARROW)
+            body = self.parse_expression()
         
         return Lambda(
             params=params,
@@ -531,12 +603,19 @@ class Parser:
         """Parse JSX element: <tag>...</tag>."""
         start = self._advance()  # <
         
-        tag = self._expect(TokenType.IDENTIFIER).value
+        tag = self._expect(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER).value
         
         # Parse attributes
         attributes = []
         while not self._check(TokenType.GT, TokenType.SLASH, TokenType.EOF):
-            attr_name = self._expect(TokenType.IDENTIFIER).value
+            # Allow keywords as attribute names (e.g., on, class, for)
+            if self._check(TokenType.IDENTIFIER):
+                attr_name = self._advance().value
+            elif self.current.type.name in ('ON', 'CLASS', 'FOR', 'TYPE', 'IN', 'IF', 'ELSE'):
+                # Allow certain keywords as attribute names in JSX
+                attr_name = self._advance().raw
+            else:
+                attr_name = self._expect(TokenType.IDENTIFIER).value
             
             attr_value = None
             if self._match(TokenType.ASSIGN):
@@ -573,13 +652,27 @@ class Parser:
                 children.append(self.parse_jsx())
             elif self._check(TokenType.STRING):
                 children.append(self.parse_string())
-            else:
+            elif self._check(TokenType.EOF):
+                raise self._error("Unterminated JSX element")
+            elif self._check(TokenType.RBRACE, TokenType.SEMICOLON):
+                # These shouldn't appear in JSX content
                 break
+            else:
+                # JSX text content - collect a single token as text
+                # This handles identifiers, operators like +/-, etc.
+                text = self.current.raw
+                text_loc = self.current.location
+                self._advance()
+                children.append(StringLiteral(
+                    value=text.strip(),
+                    is_template=False,
+                    location=text_loc
+                ))
         
         # Closing tag
         self._expect(TokenType.LT)
         self._expect(TokenType.SLASH)
-        closing_tag = self._expect(TokenType.IDENTIFIER).value
+        closing_tag = self._expect(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER).value
         if closing_tag != tag:
             raise self._error(f"Mismatched JSX tags: <{tag}> and </{closing_tag}>")
         self._expect(TokenType.GT)
@@ -641,7 +734,8 @@ class Parser:
         inclusive = op.type == TokenType.RANGE_INCLUSIVE
         
         end = None
-        if not self._check(TokenType.RBRACKET, TokenType.RPAREN, TokenType.COMMA):
+        if not self._check(TokenType.RBRACKET, TokenType.RPAREN, TokenType.COMMA,
+                          TokenType.LBRACE, TokenType.SEMICOLON):
             end = self.parse_expression(get_precedence(TokenType.RANGE) + 1)
         
         return RangeExpr(
@@ -651,10 +745,20 @@ class Parser:
             location=op.location
         )
     
-    def parse_member(self, left: Expression) -> Member:
-        """Parse member access: obj.field."""
+    def parse_member(self, left: Expression) -> Expression:
+        """Parse member access: obj.field or obj.0 (tuple)."""
         self._advance()  # .
-        member = self._expect(TokenType.IDENTIFIER).value
+        
+        # Handle tuple index (obj.0, obj.1, etc.)
+        if self._check(TokenType.INTEGER):
+            index_token = self._advance()
+            return Index(
+                object=left,
+                index=IntegerLiteral(value=index_token.value, location=index_token.location),
+                location=left.location
+            )
+        
+        member = self._expect(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER).value
         return Member(
             object=left,
             member=member,
@@ -672,23 +776,34 @@ class Parser:
         )
     
     def parse_call(self, left: Expression) -> Call:
-        """Parse function call: func(args)."""
+        """Parse function call: func(args) or func<T>(args)."""
+        # Check for type arguments func<T, U>(...)
+        type_args = []
+        
         self._advance()  # (
         
         arguments = []
         if not self._check(TokenType.RPAREN):
-            arguments.append(self.parse_expression())
+            # Handle named arguments: foo(name: value)
+            arguments.append(self._parse_call_argument())
             while self._match(TokenType.COMMA):
                 if self._check(TokenType.RPAREN):
                     break
-                arguments.append(self.parse_expression())
+                arguments.append(self._parse_call_argument())
         
         self._expect(TokenType.RPAREN)
         return Call(
             callee=left,
             arguments=arguments,
+            type_args=type_args,
             location=left.location
         )
+    
+    def _parse_call_argument(self) -> Expression:
+        """Parse a single call argument, potentially named."""
+        # For now, just parse as expression
+        # TODO: Handle named arguments like foo(name: value)
+        return self.parse_expression()
     
     def parse_index(self, left: Expression) -> Index:
         """Parse index access: arr[i]."""
@@ -714,6 +829,17 @@ class Parser:
             expr=left,
             target_type=target_type,
             location=left.location
+        )
+    
+    def parse_is_expr(self, left: Expression) -> BinaryOp:
+        """Parse is expression: expr is Type."""
+        op = self._advance()  # is
+        target_type = self.parse_type()
+        return BinaryOp(
+            left=left,
+            operator='is',
+            right=Identifier(name=str(target_type), location=op.location),
+            location=op.location
         )
     
     def parse_assign(self, left: Expression) -> BinaryOp:
@@ -827,7 +953,7 @@ class Parser:
         builtins = {'Int', 'Float', 'String', 'Bool', 'Char', 'Any',
                     'Int8', 'Int16', 'Int32', 'Int64',
                     'UInt', 'UInt8', 'UInt16', 'UInt32', 'UInt64',
-                    'Float32', 'Float64'}
+                    'Float32', 'Float64', 'Void'}
         
         if len(parts) == 1 and name in builtins and not type_args:
             return PrimitiveType(name=name)
@@ -843,7 +969,8 @@ class Parser:
             return WildcardPattern(location=self.previous.location)
         
         if self._check(TokenType.INTEGER, TokenType.FLOAT, TokenType.STRING, TokenType.CHAR):
-            return LiteralPattern(value=self.parse_expression(), location=self.current.location)
+            loc = self.current.location
+            return LiteralPattern(value=self.parse_expression(), location=loc)
         
         if self._match(TokenType.TRUE):
             return LiteralPattern(
@@ -857,8 +984,12 @@ class Parser:
                 location=self.previous.location
             )
         
+        if self._match(TokenType.NONE):
+            return EnumPattern(variant="None", fields=[], location=self.previous.location)
+        
         if self._match(TokenType.LPAREN):
             # Tuple pattern
+            start = self.previous
             elements = []
             if not self._check(TokenType.RPAREN):
                 elements.append(self.parse_pattern())
@@ -867,10 +998,11 @@ class Parser:
                         break
                     elements.append(self.parse_pattern())
             self._expect(TokenType.RPAREN)
-            return TuplePattern(elements=elements, location=self.previous.location)
+            return TuplePattern(elements=elements, location=start.location)
         
         if self._match(TokenType.LBRACKET):
             # Array pattern
+            start = self.previous
             elements = []
             rest = None
             while not self._check(TokenType.RBRACKET, TokenType.EOF):
@@ -884,7 +1016,7 @@ class Parser:
                 if not self._match(TokenType.COMMA):
                     break
             self._expect(TokenType.RBRACKET)
-            return ArrayPattern(elements=elements, rest=rest, location=self.previous.location)
+            return ArrayPattern(elements=elements, rest=rest, location=start.location)
         
         if self._check(TokenType.IDENTIFIER):
             name_tok = self._advance()
@@ -929,12 +1061,50 @@ class Parser:
                     location=name_tok.location
                 )
             
+            # Check for range pattern: 1..10
+            if self._check(TokenType.RANGE, TokenType.RANGE_INCLUSIVE):
+                is_inclusive = self._match(TokenType.RANGE_INCLUSIVE) is not None
+                if not is_inclusive:
+                    self._match(TokenType.RANGE)
+                end = self.parse_pattern()
+                return RangePattern(
+                    start=LiteralPattern(value=Identifier(name=name_tok.value, location=name_tok.location), location=name_tok.location),
+                    end=end.value if isinstance(end, LiteralPattern) else None,
+                    inclusive=is_inclusive,
+                    location=name_tok.location
+                )
+            
             return IdentifierPattern(name=name_tok.value, location=name_tok.location)
         
         if self._check(TokenType.TYPE_IDENTIFIER):
-            # Capitalized = enum variant or type
+            # Capitalized = enum variant, struct pattern, or type
             name_tok = self._advance()
             
+            # Check for struct pattern: Point { x, y }
+            if self._match(TokenType.LBRACE):
+                fields = []
+                has_rest = False
+                while not self._check(TokenType.RBRACE, TokenType.EOF):
+                    if self._match(TokenType.ELLIPSIS):
+                        has_rest = True
+                        break
+                    field_name = self._expect(TokenType.IDENTIFIER).value
+                    if self._match(TokenType.COLON):
+                        field_pattern = self.parse_pattern()
+                    else:
+                        field_pattern = IdentifierPattern(name=field_name)
+                    fields.append((field_name, field_pattern))
+                    if not self._match(TokenType.COMMA):
+                        break
+                self._expect(TokenType.RBRACE)
+                return StructPattern(
+                    type_name=name_tok.value,
+                    fields=fields,
+                    has_rest=has_rest,
+                    location=name_tok.location
+                )
+            
+            # Check for tuple enum pattern: Variant(x, y)
             if self._match(TokenType.LPAREN):
                 fields = []
                 if not self._check(TokenType.RPAREN):
@@ -944,7 +1114,30 @@ class Parser:
                 self._expect(TokenType.RPAREN)
                 return EnumPattern(variant=name_tok.value, fields=fields, location=name_tok.location)
             
+            # Unit enum variant
             return EnumPattern(variant=name_tok.value, fields=[], location=name_tok.location)
+        
+        # Check for Some/Ok/Err patterns
+        if self._match(TokenType.SOME):
+            start = self.previous
+            self._expect(TokenType.LPAREN)
+            inner = self.parse_pattern()
+            self._expect(TokenType.RPAREN)
+            return EnumPattern(variant="Some", fields=[inner], location=start.location)
+        
+        if self._match(TokenType.OK):
+            start = self.previous
+            self._expect(TokenType.LPAREN)
+            inner = self.parse_pattern()
+            self._expect(TokenType.RPAREN)
+            return EnumPattern(variant="Ok", fields=[inner], location=start.location)
+        
+        if self._match(TokenType.ERR):
+            start = self.previous
+            self._expect(TokenType.LPAREN)
+            inner = self.parse_pattern()
+            self._expect(TokenType.RPAREN)
+            return EnumPattern(variant="Err", fields=[inner], location=start.location)
         
         raise self._error(f"Expected pattern, got {self.current.type.name}")
     
@@ -952,36 +1145,74 @@ class Parser:
     
     def parse_statement(self) -> Statement:
         """Parse a statement."""
-        # Skip any annotations
+        # Skip any doc comments and annotations
+        doc_comment = None
         annotations = []
-        while self._match(TokenType.ANNOTATION):
-            annotations.append(self.previous.value)
+        
+        while self._check(TokenType.DOC_COMMENT, TokenType.ANNOTATION):
+            if self._match(TokenType.DOC_COMMENT):
+                doc_comment = self.previous.value
+            elif self._match(TokenType.ANNOTATION):
+                annotations.append(self.previous.value)
+        
+        # Public modifier
+        is_public = self._match(TokenType.PUB) is not None
         
         # Declarations
         if self._check(TokenType.LET, TokenType.VAR, TokenType.CONST, 
                       TokenType.NEURAL, TokenType.GC):
-            return self.parse_var_decl()
+            decl = self.parse_var_decl()
+            decl.is_public = is_public
+            decl.doc_comment = doc_comment
+            return decl
         
         if self._check(TokenType.FN):
-            return self.parse_function_decl(annotations)
+            decl = self.parse_function_decl(annotations)
+            decl.is_public = is_public
+            decl.doc_comment = doc_comment
+            return decl
+        
+        if self._check(TokenType.ASYNC) and self._peek_is(TokenType.FN):
+            self._advance()  # async
+            decl = self.parse_function_decl(annotations)
+            decl.is_async = True
+            decl.is_public = is_public
+            decl.doc_comment = doc_comment
+            return decl
         
         if self._check(TokenType.STRUCT):
-            return self.parse_struct_decl()
+            decl = self.parse_struct_decl()
+            decl.is_public = is_public
+            return decl
         
         if self._check(TokenType.ENUM):
-            return self.parse_enum_decl()
+            decl = self.parse_enum_decl()
+            decl.is_public = is_public
+            return decl
         
         if self._check(TokenType.TRAIT):
-            return self.parse_trait_decl()
+            decl = self.parse_trait_decl()
+            decl.is_public = is_public
+            return decl
         
         if self._check(TokenType.IMPL):
             return self.parse_impl_decl()
         
         if self._check(TokenType.TYPE):
-            return self.parse_type_alias()
+            decl = self.parse_type_alias()
+            decl.is_public = is_public
+            return decl
         
         if self._check(TokenType.COMPONENT):
-            return self.parse_component_decl()
+            decl = self.parse_component_decl()
+            decl.is_public = is_public
+            return decl
+        
+        if self._check(TokenType.ACTOR):
+            return self.parse_actor_decl()
+        
+        if self._check(TokenType.CHAN):
+            return self.parse_channel_decl()
         
         # Control flow
         if self._check(TokenType.IF):
@@ -998,22 +1229,25 @@ class Parser:
         
         if self._match(TokenType.BREAK):
             value = None
-            if not self._check(TokenType.SEMICOLON, TokenType.RBRACE, TokenType.NEWLINE):
+            label = None
+            # Check for label: break 'label
+            if not self._check(TokenType.SEMICOLON, TokenType.RBRACE, TokenType.NEWLINE, TokenType.EOF):
                 value = self.parse_expression()
-            return BreakStmt(value=value, location=self.previous.location)
+            return BreakStmt(value=value, label=label, location=self.previous.location)
         
         if self._match(TokenType.CONTINUE):
-            return ContinueStmt(location=self.previous.location)
+            label = None
+            return ContinueStmt(label=label, location=self.previous.location)
         
         if self._match(TokenType.RETURN):
             value = None
-            if not self._check(TokenType.SEMICOLON, TokenType.RBRACE, TokenType.NEWLINE):
+            if not self._check(TokenType.SEMICOLON, TokenType.RBRACE, TokenType.NEWLINE, TokenType.EOF):
                 value = self.parse_expression()
             return ReturnStmt(value=value, location=self.previous.location)
         
         if self._match(TokenType.YIELD):
             value = None
-            if not self._check(TokenType.SEMICOLON, TokenType.RBRACE, TokenType.NEWLINE):
+            if not self._check(TokenType.SEMICOLON, TokenType.RBRACE, TokenType.NEWLINE, TokenType.EOF):
                 value = self.parse_expression()
             return YieldStmt(value=value, location=self.previous.location)
         
@@ -1039,10 +1273,18 @@ class Parser:
         is_const = start.type == TokenType.CONST
         is_neural = start.type == TokenType.NEURAL
         is_gc = start.type == TokenType.GC
+        is_strict = False
+        is_heap = False
         
-        # Handle modifiers like: gc var x
+        # Handle modifiers like: gc var x, strict let x, heap let x
         if is_gc and self._match(TokenType.VAR):
             is_mutable = True
+        if is_gc and self._match(TokenType.LET):
+            is_mutable = False
+        
+        # Handle strict and heap keywords before let/var
+        if start.type == TokenType.LET and self._match(TokenType.STRICT):
+            is_strict = True
         
         name = self._expect(TokenType.IDENTIFIER).value
         
@@ -1051,8 +1293,18 @@ class Parser:
             var_type = self.parse_type()
         
         initializer = None
+        is_await = False
+        
+        # Handle both = and <~ (async assignment)
         if self._match(TokenType.ASSIGN):
             initializer = self.parse_expression()
+        elif self._match(TokenType.REVERSE_FLOW):
+            # let x <~ async_call() is sugar for let x = await async_call()
+            is_await = True
+            initializer = AwaitExpr(
+                expr=self.parse_expression(),
+                location=self.previous.location
+            )
         
         return VarDecl(
             name=name,
@@ -1062,6 +1314,8 @@ class Parser:
             is_const=is_const,
             is_neural=is_neural,
             is_gc=is_gc,
+            is_strict=is_strict,
+            is_heap=is_heap,
             location=start.location
         )
     
@@ -1072,13 +1326,39 @@ class Parser:
         params = []
         while not self._check(TokenType.RPAREN, TokenType.EOF):
             is_variadic = self._match(TokenType.ELLIPSIS) is not None
-            is_mutable = self._match(TokenType.VAR) is not None
+            is_mutable = False
+            is_ref = False
             
-            name = self._expect(TokenType.IDENTIFIER).value
+            # Handle reference parameters: &self, &mut self, &var self
+            if self._match(TokenType.BIT_AND):
+                is_ref = True
+                if self._match(TokenType.VAR):
+                    is_mutable = True
+            elif self._match(TokenType.VAR):
+                is_mutable = True
             
-            param_type = None
-            if self._match(TokenType.COLON):
-                param_type = self.parse_type()
+            # Handle self parameter
+            if self._check(TokenType.SELF):
+                self._advance()
+                name = "self"
+                param_type = ReferenceType(
+                    inner_type=NamedType(
+                        name=QualifiedName(parts=["Self"], location=self.previous.location),
+                        type_args=[]
+                    ),
+                    is_mutable=is_mutable
+                ) if is_ref else NamedType(
+                    name=QualifiedName(parts=["Self"], location=self.previous.location),
+                    type_args=[]
+                )
+            else:
+                name = self._expect(TokenType.IDENTIFIER).value
+                param_type = None
+                if self._match(TokenType.COLON):
+                    param_type = self.parse_type()
+                # If we got a ref but no explicit type, wrap in reference
+                if is_ref and param_type is not None:
+                    param_type = ReferenceType(inner_type=param_type, is_mutable=is_mutable)
             
             default_value = None
             if self._match(TokenType.ASSIGN):
@@ -1103,8 +1383,11 @@ class Parser:
         start = self._advance()  # fn
         
         is_async = False
-        if start.type == TokenType.ASYNC:
-            is_async = True
+        is_const = False
+        
+        # Check for const fn
+        if start.type == TokenType.CONST:
+            is_const = True
             self._expect(TokenType.FN)
         
         name = self._expect(TokenType.IDENTIFIER).value
@@ -1112,9 +1395,9 @@ class Parser:
         # Type parameters
         type_params = []
         if self._match(TokenType.LT):
-            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.COMMA):
-                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             self._expect(TokenType.GT)
         
         params = self.parse_parameter_list()
@@ -1123,12 +1406,25 @@ class Parser:
         if self._match(TokenType.FLOW):
             return_type = self.parse_type()
         
+        # Where clause for bounds
+        where_clause = []
+        if self._match(TokenType.WHERE):
+            while True:
+                type_name = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
+                self._expect(TokenType.COLON)
+                bounds = [self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value]
+                while self._match(TokenType.PLUS):
+                    bounds.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
+                where_clause.append((type_name, bounds))
+                if not self._match(TokenType.COMMA):
+                    break
+        
         # Effects
         effects = []
         if self._match(TokenType.WITH):
-            effects.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            effects.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.COMMA):
-                effects.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                effects.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
         
         body = None
         if self._match(TokenType.LBRACE):
@@ -1140,7 +1436,9 @@ class Parser:
             return_type=return_type,
             body=body,
             is_async=is_async,
+            is_const=is_const,
             type_params=type_params,
+            where_clause=where_clause,
             effects=effects,
             annotations=annotations or [],
             location=start.location
@@ -1149,13 +1447,13 @@ class Parser:
     def parse_struct_decl(self) -> StructDecl:
         """Parse struct declaration."""
         start = self._advance()  # struct
-        name = self._expect(TokenType.TYPE_IDENTIFIER).value
+        name = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
         
         type_params = []
         if self._match(TokenType.LT):
-            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.COMMA):
-                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             self._expect(TokenType.GT)
         
         self._expect(TokenType.LBRACE)
@@ -1192,13 +1490,13 @@ class Parser:
     def parse_enum_decl(self) -> EnumDecl:
         """Parse enum declaration."""
         start = self._advance()  # enum
-        name = self._expect(TokenType.TYPE_IDENTIFIER).value
+        name = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
         
         type_params = []
         if self._match(TokenType.LT):
-            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.COMMA):
-                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             self._expect(TokenType.GT)
         
         self._expect(TokenType.LBRACE)
@@ -1244,20 +1542,20 @@ class Parser:
     def parse_trait_decl(self) -> TraitDecl:
         """Parse trait declaration."""
         start = self._advance()  # trait
-        name = self._expect(TokenType.TYPE_IDENTIFIER).value
+        name = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
         
         type_params = []
         if self._match(TokenType.LT):
-            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.COMMA):
-                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             self._expect(TokenType.GT)
         
         super_traits = []
         if self._match(TokenType.COLON):
-            super_traits.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            super_traits.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.PLUS):
-                super_traits.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                super_traits.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
         
         self._expect(TokenType.LBRACE)
         
@@ -1281,9 +1579,9 @@ class Parser:
         
         type_params = []
         if self._match(TokenType.LT):
-            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.COMMA):
-                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             self._expect(TokenType.GT)
         
         # Could be "impl Type" or "impl Trait for Type"
@@ -1293,7 +1591,12 @@ class Parser:
         target_type = first_type
         
         if self._match(TokenType.FOR):
-            trait_name = first_type.name.full_name() if isinstance(first_type, NamedType) else str(first_type)
+            if isinstance(first_type, NamedType):
+                trait_name = first_type.name.full_name()
+            elif isinstance(first_type, PrimitiveType):
+                trait_name = first_type.name
+            else:
+                trait_name = str(first_type)
             target_type = self.parse_type()
         
         self._expect(TokenType.LBRACE)
@@ -1315,13 +1618,13 @@ class Parser:
     def parse_type_alias(self) -> TypeAlias:
         """Parse type alias."""
         start = self._advance()  # type
-        name = self._expect(TokenType.TYPE_IDENTIFIER).value
+        name = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
         
         type_params = []
         if self._match(TokenType.LT):
-            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+            type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             while self._match(TokenType.COMMA):
-                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER).value)
+                type_params.append(self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value)
             self._expect(TokenType.GT)
         
         self._expect(TokenType.ASSIGN)
@@ -1337,7 +1640,7 @@ class Parser:
     def parse_component_decl(self) -> ComponentDecl:
         """Parse component declaration."""
         start = self._advance()  # component
-        name = self._expect(TokenType.TYPE_IDENTIFIER).value
+        name = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
         
         self._expect(TokenType.LBRACE)
         
@@ -1349,14 +1652,29 @@ class Parser:
         
         while not self._check(TokenType.RBRACE, TokenType.EOF):
             if self._match(TokenType.STATE):
-                state.append(self.parse_var_decl())
+                # state count: Int = 0 OR state { ... }
+                if self._check(TokenType.LBRACE):
+                    self._advance()
+                    while not self._check(TokenType.RBRACE, TokenType.EOF):
+                        state.append(self._parse_field_decl())
+                    self._expect(TokenType.RBRACE)
+                else:
+                    state.append(self._parse_field_decl())
             elif self._match(TokenType.PROPS):
                 self._expect(TokenType.LBRACE)
-                while not self._check(TokenType.RBRACE):
-                    props.append(self.parse_var_decl())
+                while not self._check(TokenType.RBRACE, TokenType.EOF):
+                    # Props can have 'let' keyword or just field: Type = value
+                    if self._check(TokenType.LET, TokenType.VAR, TokenType.CONST):
+                        props.append(self.parse_var_decl())
+                    else:
+                        props.append(self._parse_field_decl())
                 self._expect(TokenType.RBRACE)
             elif self._match(TokenType.ON):
-                hook = self._expect(TokenType.IDENTIFIER).value
+                # Lifecycle hook - name could be a keyword (mount, unmount, update) or identifier
+                if self._check(TokenType.MOUNT, TokenType.UNMOUNT, TokenType.UPDATE):
+                    hook = self._advance().raw
+                else:
+                    hook = self._expect(TokenType.IDENTIFIER).value
                 self._expect(TokenType.LBRACE)
                 lifecycle[hook] = self.parse_block_body(self.previous)
             elif self._match(TokenType.RENDER):
@@ -1377,6 +1695,83 @@ class Parser:
             methods=methods,
             lifecycle=lifecycle,
             render=render,
+            location=start.location
+        )
+    
+    def _parse_field_decl(self) -> VarDecl:
+        """Parse a field declaration like: name: Type = value."""
+        start_loc = self.current.location
+        name = self._expect(TokenType.IDENTIFIER).value
+        
+        var_type = None
+        if self._match(TokenType.COLON):
+            var_type = self.parse_type()
+        
+        initializer = None
+        if self._match(TokenType.ASSIGN):
+            initializer = self.parse_expression()
+        
+        return VarDecl(
+            name=name,
+            var_type=var_type,
+            initializer=initializer,
+            is_mutable=True,  # Component state is mutable
+            location=start_loc
+        )
+    
+    def parse_actor_decl(self) -> ActorDecl:
+        """Parse actor declaration."""
+        start = self._advance()  # actor
+        name = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
+        
+        self._expect(TokenType.LBRACE)
+        
+        state = []
+        receives = []
+        
+        while not self._check(TokenType.RBRACE, TokenType.EOF):
+            if self._match(TokenType.STATE):
+                state.append(self.parse_var_decl())
+            elif self._match(TokenType.RECEIVE):
+                msg_type = self._expect(TokenType.TYPE_IDENTIFIER, TokenType.IDENTIFIER).value
+                self._expect(TokenType.ARROW)
+                if self._check(TokenType.LBRACE):
+                    self._advance()
+                    body = self.parse_block_body(self.previous)
+                else:
+                    expr = self.parse_expression()
+                    body = Block(statements=[], final_expr=expr, location=expr.location)
+                receives.append((msg_type, body))
+            else:
+                raise self._error(f"Unexpected token in actor: {self.current.type.name}")
+        
+        self._expect(TokenType.RBRACE)
+        
+        return ActorDecl(
+            name=name,
+            state=state,
+            receives=receives,
+            location=start.location
+        )
+    
+    def parse_channel_decl(self) -> ChannelDecl:
+        """Parse channel declaration."""
+        start = self._advance()  # chan
+        name = self._expect(TokenType.IDENTIFIER).value
+        
+        self._expect(TokenType.COLON)
+        element_type = self.parse_type()
+        
+        capacity = None
+        if self._match(TokenType.LPAREN):
+            cap_tok = self._expect(TokenType.INTEGER)
+            capacity = cap_tok.value
+            self._expect(TokenType.RPAREN)
+        
+        return ChannelDecl(
+            name=name,
+            element_type=element_type,
+            capacity=capacity,
             location=start.location
         )
     
@@ -1409,9 +1804,16 @@ class Parser:
         self._expect(TokenType.LBRACE)
         body = self.parse_block_body(self.previous)
         
+        # Optional else branch (executed if loop never runs)
+        else_branch = None
+        if self._match(TokenType.ELSE):
+            self._expect(TokenType.LBRACE)
+            else_branch = self.parse_block_body(self.previous)
+        
         return WhileStmt(
             condition=condition,
             body=body,
+            else_branch=else_branch,
             location=start.location
         )
     
@@ -1443,10 +1845,14 @@ class Parser:
     def parse_loop_stmt(self) -> LoopStmt:
         """Parse loop statement."""
         start = self._advance()  # loop
+        
+        # Optional label: 'label: loop { ... }
+        label = None
+        
         self._expect(TokenType.LBRACE)
         body = self.parse_block_body(self.previous)
         
-        return LoopStmt(body=body, location=start.location)
+        return LoopStmt(body=body, label=label, location=start.location)
     
     def parse_try_stmt(self) -> TryStmt:
         """Parse try statement."""
@@ -1497,6 +1903,8 @@ class Parser:
             self._expect(TokenType.ASSIGN)
             expr = self.parse_expression()
             tasks.append((name, expr))
+            self._match(TokenType.SEMICOLON)
+            self._match(TokenType.COMMA)
         
         self._expect(TokenType.RBRACE)
         
@@ -1510,13 +1918,15 @@ class Parser:
         
         path = [self._expect(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER).value]
         while self._match(TokenType.TRAIT_IMPL):
+            if self._check(TokenType.LBRACE, TokenType.STAR):
+                break
             path.append(self._expect(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER).value)
         
         items = []
         alias = None
         is_wildcard = False
         
-        if self._match(TokenType.TRAIT_IMPL):
+        if self._match(TokenType.TRAIT_IMPL) or self._check(TokenType.LBRACE, TokenType.STAR):
             if self._match(TokenType.LBRACE):
                 # use path::{A, B, C}
                 items.append(self._expect(TokenType.IDENTIFIER, TokenType.TYPE_IDENTIFIER).value)
@@ -1564,8 +1974,12 @@ class Parser:
                 try:
                     declarations.append(self.parse_statement())
                 except ParseError as e:
-                    print(f"Parse error: {e}")
+                    self._report_error(e)
                     self._sync()
+        
+        # If we accumulated errors, report them all
+        if self.errors:
+            raise ParseErrorCollection(self.errors)
         
         return Program(
             module_path=module_path,
@@ -1574,10 +1988,157 @@ class Parser:
         )
 
 
+# === AST UTILITIES ===
+
+class ASTPrinter(ASTVisitor):
+    """Pretty-print an AST for debugging."""
+    
+    def __init__(self):
+        self.indent_level = 0
+        self.output = StringIO()
+    
+    def indent(self) -> str:
+        return "  " * self.indent_level
+    
+    def print(self, text: str):
+        self.output.write(f"{self.indent()}{text}\n")
+    
+    def generic_visit(self, node: ASTNode) -> str:
+        node_name = node.__class__.__name__
+        self.print(f"{node_name}")
+        self.indent_level += 1
+        for child in node.children():
+            self.visit(child)
+        self.indent_level -= 1
+        return self.output.getvalue()
+    
+    def visit_IntegerLiteral(self, node: IntegerLiteral) -> str:
+        self.print(f"IntegerLiteral({node.value})")
+        return self.output.getvalue()
+    
+    def visit_FloatLiteral(self, node: FloatLiteral) -> str:
+        self.print(f"FloatLiteral({node.value})")
+        return self.output.getvalue()
+    
+    def visit_StringLiteral(self, node: StringLiteral) -> str:
+        self.print(f"StringLiteral({repr(node.value)})")
+        return self.output.getvalue()
+    
+    def visit_BoolLiteral(self, node: BoolLiteral) -> str:
+        self.print(f"BoolLiteral({node.value})")
+        return self.output.getvalue()
+    
+    def visit_Identifier(self, node: Identifier) -> str:
+        self.print(f"Identifier({node.name})")
+        return self.output.getvalue()
+    
+    def visit_BinaryOp(self, node: BinaryOp) -> str:
+        self.print(f"BinaryOp({node.operator})")
+        self.indent_level += 1
+        self.visit(node.left)
+        self.visit(node.right)
+        self.indent_level -= 1
+        return self.output.getvalue()
+    
+    def visit_UnaryOp(self, node: UnaryOp) -> str:
+        self.print(f"UnaryOp({node.operator})")
+        self.indent_level += 1
+        self.visit(node.operand)
+        self.indent_level -= 1
+        return self.output.getvalue()
+    
+    def visit_Call(self, node: Call) -> str:
+        self.print("Call")
+        self.indent_level += 1
+        self.print("callee:")
+        self.indent_level += 1
+        self.visit(node.callee)
+        self.indent_level -= 1
+        self.print("arguments:")
+        self.indent_level += 1
+        for arg in node.arguments:
+            self.visit(arg)
+        self.indent_level -= 2
+        return self.output.getvalue()
+    
+    def visit_FunctionDecl(self, node: FunctionDecl) -> str:
+        self.print(f"FunctionDecl({node.name})")
+        self.indent_level += 1
+        self.print("params:")
+        self.indent_level += 1
+        for param in node.params:
+            self.print(f"Parameter({param.name}: {param.param_type})")
+        self.indent_level -= 1
+        if node.return_type:
+            self.print(f"return_type: {node.return_type}")
+        if node.body:
+            self.print("body:")
+            self.indent_level += 1
+            self.visit(node.body)
+            self.indent_level -= 1
+        self.indent_level -= 1
+        return self.output.getvalue()
+
+
+def print_ast(ast: ASTNode) -> str:
+    """Pretty-print an AST."""
+    printer = ASTPrinter()
+    printer.visit(ast)
+    return printer.output.getvalue()
+
+
+def format_expression(expr: Expression) -> str:
+    """Format an expression back to source code."""
+    if isinstance(expr, IntegerLiteral):
+        return str(expr.value)
+    elif isinstance(expr, FloatLiteral):
+        return str(expr.value)
+    elif isinstance(expr, StringLiteral):
+        return f'"{expr.value}"'
+    elif isinstance(expr, BoolLiteral):
+        return "true" if expr.value else "false"
+    elif isinstance(expr, NoneLiteral):
+        return "None"
+    elif isinstance(expr, Identifier):
+        return expr.name
+    elif isinstance(expr, QualifiedName):
+        return expr.full_name()
+    elif isinstance(expr, BinaryOp):
+        return f"({format_expression(expr.left)} {expr.operator} {format_expression(expr.right)})"
+    elif isinstance(expr, UnaryOp):
+        return f"{expr.operator}{format_expression(expr.operand)}"
+    elif isinstance(expr, Call):
+        args = ", ".join(format_expression(a) for a in expr.arguments)
+        return f"{format_expression(expr.callee)}({args})"
+    elif isinstance(expr, Member):
+        return f"{format_expression(expr.object)}.{expr.member}"
+    elif isinstance(expr, Index):
+        return f"{format_expression(expr.object)}[{format_expression(expr.index)}]"
+    elif isinstance(expr, ArrayLiteral):
+        elems = ", ".join(format_expression(e) for e in expr.elements)
+        return f"[{elems}]"
+    elif isinstance(expr, TupleLiteral):
+        elems = ", ".join(format_expression(e) for e in expr.elements)
+        return f"({elems})"
+    elif isinstance(expr, Lambda):
+        params = ", ".join(p.name for p in expr.params)
+        return f"fn({params}) => {format_expression(expr.body)}"
+    else:
+        return f"<{expr.__class__.__name__}>"
+
+
+# === PUBLIC API ===
+
 def parse(source: str, filename: str = "<input>") -> Program:
     """Parse source code into an AST."""
     parser = Parser(source, filename)
     return parser.parse_program()
+
+
+def parse_expression_only(source: str) -> Expression:
+    """Parse just an expression (for REPL/eval)."""
+    parser = Parser(source, "<expr>")
+    return parser.parse_expression()
 
 
 def parse_file(filepath: str) -> Program:
@@ -1585,3 +2146,63 @@ def parse_file(filepath: str) -> Program:
     with open(filepath, 'r', encoding='utf-8') as f:
         source = f.read()
     return parse(source, filepath)
+
+
+def validate_syntax(source: str, filename: str = "<input>") -> list[ParseError]:
+    """Validate syntax without raising exceptions, return list of errors."""
+    parser = Parser(source, filename)
+    try:
+        parser.parse_program()
+        return []
+    except ParseErrorCollection as e:
+        return e.errors
+    except ParseError as e:
+        return [e]
+
+
+# === REPL HELPERS ===
+
+def is_complete_input(source: str) -> bool:
+    """Check if input is syntactically complete (for REPL)."""
+    # Count braces, parens, brackets
+    depth = {'(': 0, '[': 0, '{': 0}
+    in_string = False
+    string_char = None
+    
+    i = 0
+    while i < len(source):
+        c = source[i]
+        
+        # Handle escape sequences
+        if c == '\\' and in_string:
+            i += 2
+            continue
+        
+        # Handle string boundaries
+        if c in '"\'`' and not in_string:
+            in_string = True
+            string_char = c
+        elif c == string_char and in_string:
+            in_string = False
+            string_char = None
+        
+        # Count delimiters outside strings
+        if not in_string:
+            if c == '(':
+                depth['('] += 1
+            elif c == ')':
+                depth['('] -= 1
+            elif c == '[':
+                depth['['] += 1
+            elif c == ']':
+                depth['['] -= 1
+            elif c == '{':
+                depth['{'] += 1
+            elif c == '}':
+                depth['{'] -= 1
+        
+        i += 1
+    
+    # Complete if all delimiters balanced and not in string
+    return (all(d == 0 for d in depth.values()) and 
+            not in_string)
