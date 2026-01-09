@@ -9,7 +9,10 @@ from typing import Iterator, Optional
 from dataclasses import dataclass
 import re
 
-from .tokens import Token, TokenType, SourceLocation, KEYWORDS
+try:
+    from .tokens import Token, TokenType, SourceLocation, KEYWORDS
+except ImportError:
+    from tokens import Token, TokenType, SourceLocation, KEYWORDS
 
 
 class LexerError(Exception):

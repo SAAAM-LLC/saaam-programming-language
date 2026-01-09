@@ -11,7 +11,10 @@ from dataclasses import dataclass, field
 from typing import Optional, Union, Any
 from enum import Enum, auto
 
-from .tokens import SourceLocation, Token
+try:
+    from .tokens import SourceLocation, Token
+except ImportError:
+    from tokens import SourceLocation, Token
 
 
 # === BASE NODES ===
