@@ -7,10 +7,12 @@ we process MEANING and INTENT directly from source code.
 """
 
 import re
+import math
+import random
+import hashlib
 from typing import List, Dict, Any, Optional, Union, Tuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
-import numpy as np
 
 class ConceptType(Enum):
     """Types of concepts we can extract from source."""
@@ -33,7 +35,7 @@ class Concept:
     """A concept extracted from source code."""
     concept_type: ConceptType
     content: str
-    semantic_vector: np.ndarray  # Neural embedding
+    semantic_vector: List[float]  # Deterministic embedding (stdlib-only)
     location: Tuple[int, int]    # (line, col)
     confidence: float = 1.0
     relationships: List['ConceptRelation'] = field(default_factory=list)
@@ -55,6 +57,9 @@ class ConceptProcessor:
     """
     
     def __init__(self):
+        self.embedding_dim = 128
+        self._base_rng = random.Random(0x5AA4)  # stable, process-wide
+
         # Concept pattern recognition
         self.concept_patterns = {
             ConceptType.NEURAL: [
@@ -87,7 +92,7 @@ class ConceptProcessor:
             ],
         }
         
-        # Semantic embeddings (simplified - would use actual neural model)
+        # Semantic embeddings: deterministic vectors without external deps.
         self.concept_embeddings = {}
         self._init_embeddings()
         
@@ -96,23 +101,31 @@ class ConceptProcessor:
         
     def _init_embeddings(self):
         """Initialize concept embeddings for semantic understanding."""
-        # In a real implementation, these would be learned neural embeddings
-        # For now, using simple vectors to demonstrate the concept
-        embedding_dim = 128
-        
+        embedding_dim = self.embedding_dim
+
         base_concepts = {
-            'neural': np.random.rand(embedding_dim),
-            'morph': np.random.rand(embedding_dim), 
-            'flow': np.random.rand(embedding_dim),
-            'transform': np.random.rand(embedding_dim),
-            'identity': np.random.rand(embedding_dim),
-            'reactive': np.random.rand(embedding_dim),
-            'component': np.random.rand(embedding_dim),
-            'function': np.random.rand(embedding_dim),
-            'variable': np.random.rand(embedding_dim),
+            'neural': self._rand_vec(self._base_rng, embedding_dim),
+            'morph': self._rand_vec(self._base_rng, embedding_dim),
+            'flow': self._rand_vec(self._base_rng, embedding_dim),
+            'transform': self._rand_vec(self._base_rng, embedding_dim),
+            'identity': self._rand_vec(self._base_rng, embedding_dim),
+            'reactive': self._rand_vec(self._base_rng, embedding_dim),
+            'component': self._rand_vec(self._base_rng, embedding_dim),
+            'function': self._rand_vec(self._base_rng, embedding_dim),
+            'variable': self._rand_vec(self._base_rng, embedding_dim),
         }
         
         self.concept_embeddings = base_concepts
+
+    @staticmethod
+    def _rand_vec(rng: random.Random, dim: int) -> List[float]:
+        # Standard-normal is a better default for cosine similarity than uniform [0,1].
+        return [rng.gauss(0.0, 1.0) for _ in range(dim)]
+
+    @staticmethod
+    def _seed64(*parts: str) -> int:
+        h = hashlib.blake2b(("|".join(parts)).encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(h, "little", signed=False)
         
     def process_source(self, source: str) -> List[Concept]:
         """
@@ -184,7 +197,7 @@ class ConceptProcessor:
         )
         
     def _get_semantic_embedding(self, concept_type: ConceptType, content: str, 
-                               full_line: str) -> np.ndarray:
+                               full_line: str) -> List[float]:
         """Generate semantic embedding for a concept."""
         # Start with base embedding for concept type
         if concept_type == ConceptType.NEURAL:
@@ -198,13 +211,15 @@ class ConceptProcessor:
         elif concept_type == ConceptType.IDENTITY:
             base = self.concept_embeddings['identity']
         else:
-            base = np.random.rand(128)
-            
-        # Modify based on content and context
-        content_modifier = np.random.rand(128) * 0.1  # Simplified
-        context_modifier = np.random.rand(128) * 0.05  # Simplified
-        
-        return base + content_modifier + context_modifier
+            base = self._rand_vec(random.Random(self._seed64("base", concept_type.name)), self.embedding_dim)
+
+        # Modify based on content and context (deterministic micro-noise).
+        rng_content = random.Random(self._seed64("content", concept_type.name, content))
+        rng_context = random.Random(self._seed64("context", full_line))
+        content_modifier = [rng_content.gauss(0.0, 0.10) for _ in range(self.embedding_dim)]
+        context_modifier = [rng_context.gauss(0.0, 0.05) for _ in range(self.embedding_dim)]
+
+        return [b + cm + xm for b, cm, xm in zip(base, content_modifier, context_modifier)]
         
     def _calculate_confidence(self, concept_type: ConceptType, content: str,
                              full_line: str) -> float:
@@ -271,7 +286,8 @@ class ConceptProcessor:
         
         for intent_name, pattern in intent_patterns.items():
             if re.search(pattern, line, re.IGNORECASE):
-                embedding = np.random.rand(128)  # Simplified intent embedding
+                rng = random.Random(self._seed64("intent", intent_name, line))
+                embedding = self._rand_vec(rng, self.embedding_dim)
                 
                 return Concept(
                     concept_type=ConceptType.INTENT,
@@ -300,10 +316,16 @@ class ConceptProcessor:
                         
     def _find_relationship(self, concept1: Concept, concept2: Concept) -> Optional[ConceptRelation]:
         """Find semantic relationship between two concepts."""
-        # Semantic similarity using embeddings
-        similarity = np.dot(concept1.semantic_vector, concept2.semantic_vector) / (
-            np.linalg.norm(concept1.semantic_vector) * np.linalg.norm(concept2.semantic_vector)
-        )
+        # Semantic similarity (cosine) using stdlib math.
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for a, b in zip(concept1.semantic_vector, concept2.semantic_vector):
+            dot += a * b
+            na += a * a
+            nb += b * b
+        denom = math.sqrt(na) * math.sqrt(nb) + 1e-12
+        similarity = dot / denom
         
         if similarity > 0.8:  # High similarity threshold
             # Determine relationship type based on concept types and content

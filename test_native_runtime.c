@@ -1,229 +1,155 @@
 /*
-SAAAM Native Runtime - Test Program
-Demonstrates neuroplastic morphing, ternary logic, and performance
+SAAAM Native Runtime - C Test Suite
+Builds without external dependencies.
 */
 
 #include "saaam_native_runtime.h"
-#include <stdio.h>
+
 #include <assert.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
 
-void test_neuroplastic_morphing(saaam_runtime_t* runtime) {
-    printf("\n🧠 TEST: Neuroplastic Morphing\n");
-    printf("="*50 "\n");
+static void test_morphing(void) {
+    saaam_runtime_t* rt = saaam_runtime_init();
+    assert(rt);
 
-    // Create a neural value starting as integer
-    saaam_value_t* magic = saaam_create_neural(runtime, SAAAM_TYPE_INT);
-    magic->data.i64 = 42;
-    printf("✓ Created neural value: %lld (Int)\n", (long long)magic->data.i64);
+    saaam_value_t* v = saaam_create_neural(rt, SAAAM_TYPE_INT);
+    assert(v);
+    assert(v->type == SAAAM_TYPE_INT);
+    assert(v->memory_region == SAAAM_MEMORY_NEURAL);
+    assert((v->flags & SAAAM_VALUE_FLAG_NEURAL) != 0);
 
-    // Morph to String
-    saaam_morph_value(runtime, magic, SAAAM_TYPE_STRING);
-    printf("✓ Morphed to String: '%s'\n", magic->data.string);
+    assert(saaam_value_set_int(rt, v, 42));
+    assert(saaam_morph_value(rt, v, SAAAM_TYPE_STRING));
+    assert(v->type == SAAAM_TYPE_STRING);
+    assert(v->data.string.ptr);
+    assert(strcmp(v->data.string.ptr, "42") == 0);
 
-    // Morph to Float
-    saaam_create_string(runtime, "3.14159");  // Target value
-    saaam_morph_value(runtime, magic, SAAAM_TYPE_FLOAT);
-    printf("✓ Morphed to Float: %f\n", magic->data.f64);
+    assert(saaam_morph_value(rt, v, SAAAM_TYPE_FLOAT));
+    assert(v->type == SAAAM_TYPE_FLOAT);
+    assert(fabs(v->data.f64 - 42.0) < 1e-9);
 
-    // Morph to Bool
-    saaam_morph_value(runtime, magic, SAAAM_TYPE_BOOL);
-    printf("✓ Morphed to Bool: %s\n", magic->data.boolean ? "true" : "false");
+    assert(saaam_morph_value(rt, v, SAAAM_TYPE_BOOL));
+    assert(v->type == SAAAM_TYPE_BOOL);
+    assert(v->data.boolean == true);
 
-    // Check morph history
-    printf("✓ Morph history count: %u\n", magic->morph_count);
-    saaam_morph_history_t* history = magic->morph_history;
-    while (history) {
-        printf("  - %d -> %d @ %llu ns\n",
-               history->from_type, history->to_type,
-               (unsigned long long)history->timestamp);
-        history = history->next;
-    }
+    assert(v->morph_count >= 3);
 
-    printf("✓ Neuroplastic morphing SUCCESS!\n");
+    saaam_runtime_destroy(rt);
 }
 
-void test_ternary_logic(saaam_runtime_t* runtime) {
-    printf("\n⚡ TEST: Ternary Logic Operations\n");
-    printf("="*50 "\n");
+static void test_binding(void) {
+    saaam_runtime_t* rt = saaam_runtime_init();
+    assert(rt);
 
-    // Test AND
-    saaam_ternary_t result_and_tt = saaam_ternary_and(SAAAM_TERNARY_TRUE, SAAAM_TERNARY_TRUE);
-    assert(result_and_tt == SAAAM_TERNARY_TRUE);
-    printf("✓ TRUE && TRUE = TRUE\n");
+    saaam_value_t* a = saaam_create_neural(rt, SAAAM_TYPE_INT);
+    saaam_value_t* b = saaam_create_neural(rt, SAAAM_TYPE_INT);
+    assert(a && b);
 
-    saaam_ternary_t result_and_tu = saaam_ternary_and(SAAAM_TERNARY_TRUE, SAAAM_TERNARY_UNKNOWN);
-    assert(result_and_tu == SAAAM_TERNARY_UNKNOWN);
-    printf("✓ TRUE && UNKNOWN = UNKNOWN\n");
+    assert(saaam_value_set_int(rt, a, 7));
+    assert(saaam_synapse_bind(rt, a, b));
 
-    saaam_ternary_t result_and_tf = saaam_ternary_and(SAAAM_TERNARY_TRUE, SAAAM_TERNARY_FALSE);
-    assert(result_and_tf == SAAAM_TERNARY_FALSE);
-    printf("✓ TRUE && FALSE = FALSE\n");
+    // initial sync
+    assert(b->type == SAAAM_TYPE_INT);
+    assert(b->data.i64 == 7);
 
-    // Test OR
-    saaam_ternary_t result_or_ff = saaam_ternary_or(SAAAM_TERNARY_FALSE, SAAAM_TERNARY_FALSE);
-    assert(result_or_ff == SAAAM_TERNARY_FALSE);
-    printf("✓ FALSE || FALSE = FALSE\n");
+    // propagate a -> b
+    assert(saaam_value_set_int(rt, a, 123));
+    assert(b->data.i64 == 123);
 
-    saaam_ternary_t result_or_fu = saaam_ternary_or(SAAAM_TERNARY_FALSE, SAAAM_TERNARY_UNKNOWN);
-    assert(result_or_fu == SAAAM_TERNARY_UNKNOWN);
-    printf("✓ FALSE || UNKNOWN = UNKNOWN\n");
+    // propagate b -> a
+    assert(saaam_value_set_int(rt, b, -9));
+    assert(a->data.i64 == -9);
 
-    saaam_ternary_t result_or_tu = saaam_ternary_or(SAAAM_TERNARY_TRUE, SAAAM_TERNARY_UNKNOWN);
-    assert(result_or_tu == SAAAM_TERNARY_TRUE);
-    printf("✓ TRUE || UNKNOWN = TRUE\n");
-
-    // Test NOT
-    saaam_ternary_t result_not_t = saaam_ternary_not(SAAAM_TERNARY_TRUE);
-    assert(result_not_t == SAAAM_TERNARY_FALSE);
-    printf("✓ !TRUE = FALSE\n");
-
-    saaam_ternary_t result_not_u = saaam_ternary_not(SAAAM_TERNARY_UNKNOWN);
-    assert(result_not_u == SAAAM_TERNARY_UNKNOWN);
-    printf("✓ !UNKNOWN = UNKNOWN\n");
-
-    printf("✓ Ternary logic operations SUCCESS!\n");
+    saaam_runtime_destroy(rt);
 }
 
-void test_memory_regions(saaam_runtime_t* runtime) {
-    printf("\n💾 TEST: Memory Regions\n");
-    printf("="*50 "\n");
-
-    // Stack allocation
-    saaam_value_t* stack_val = saaam_create_int(runtime, 100);
-    assert(stack_val->memory_region == SAAAM_MEMORY_STACK);
-    printf("✓ Stack allocation: %lld\n", (long long)stack_val->data.i64);
-
-    // Heap allocation
-    saaam_value_t* heap_val = saaam_create_string(runtime, "Hello from heap!");
-    assert(heap_val->memory_region == SAAAM_MEMORY_HEAP);
-    printf("✓ Heap allocation: '%s'\n", heap_val->data.string);
-
-    // Neural pool allocation
-    saaam_value_t* neural_val = saaam_create_neural(runtime, SAAAM_TYPE_FLOAT);
-    neural_val->data.f64 = 2.71828;
-    assert(neural_val->memory_region == SAAAM_MEMORY_NEURAL);
-    assert(neural_val->is_neural == true);
-    printf("✓ Neural pool allocation: %f (morphable)\n", neural_val->data.f64);
-
-    // GC allocation
-    saaam_value_t* gc_val = saaam_alloc_value(runtime, SAAAM_TYPE_INT, SAAAM_MEMORY_GC);
-    gc_val->data.i64 = 999;
-    assert(gc_val->memory_region == SAAAM_MEMORY_GC);
-    printf("✓ GC allocation: %lld\n", (long long)gc_val->data.i64);
-
-    printf("✓ Memory regions SUCCESS!\n");
+static saaam_value_t* fn_double_int(saaam_runtime_t* rt, saaam_value_t* input, void* user_data) {
+    (void)user_data;
+    if (!rt || !input) return NULL;
+    if (input->type != SAAAM_TYPE_INT) return NULL;
+    return saaam_create_int(rt, input->data.i64 * 2);
 }
 
-void test_synapse_operators(saaam_runtime_t* runtime) {
-    printf("\n⚡ TEST: Synapse Operators\n");
-    printf("="*50 "\n");
+static void test_flow(void) {
+    saaam_runtime_t* rt = saaam_runtime_init();
+    assert(rt);
 
-    // Create neural values
-    saaam_value_t* src = saaam_create_neural(runtime, SAAAM_TYPE_INT);
-    src->data.i64 = 42;
+    saaam_value_t* f = saaam_create_function(rt, fn_double_int, NULL, NULL);
+    saaam_value_t* x = saaam_create_int(rt, 21);
+    assert(f && x);
 
-    saaam_value_t* target = saaam_create_string(runtime, "target");
+    saaam_value_t* y = saaam_synapse_flow(rt, x, f);
+    assert(y);
+    assert(y->type == SAAAM_TYPE_INT);
+    assert(y->data.i64 == 42);
 
-    // Test morph operator ~>
-    saaam_value_t* morphed = saaam_synapse_morph(runtime, src, target);
-    assert(morphed->type == SAAAM_TYPE_STRING);
-    printf("✓ Morph operator (~>): Int -> String\n");
-
-    // Test bind operator <=>
-    saaam_value_t* left = saaam_create_int(runtime, 10);
-    saaam_value_t* right = saaam_create_int(runtime, 20);
-    saaam_value_t* bound = saaam_synapse_bind(runtime, left, right);
-    printf("✓ Bind operator (<=>): Bidirectional binding\n");
-
-    // Test flow operator ->
-    saaam_value_t* input = saaam_create_int(runtime, 5);
-    saaam_value_t* flowed = saaam_synapse_flow(runtime, input, NULL);
-    printf("✓ Flow operator (->): Pipeline flow\n");
-
-    // Test inject operator @>
-    saaam_value_t* dependency = saaam_create_string(runtime, "dependency");
-    saaam_value_t* injected = saaam_synapse_inject(runtime, dependency, NULL);
-    printf("✓ Inject operator (@>): Dependency injection\n");
-
-    printf("✓ Synapse operators SUCCESS!\n");
+    saaam_runtime_destroy(rt);
 }
 
-void test_gc_collection(saaam_runtime_t* runtime) {
-    printf("\n🗑️  TEST: Garbage Collection\n");
-    printf("="*50 "\n");
+static void test_inject(void) {
+    saaam_runtime_t* rt = saaam_runtime_init();
+    assert(rt);
 
-    size_t initial_gc_count = runtime->memory->gc_count;
-    printf("Initial GC objects: %zu\n", initial_gc_count);
+    saaam_value_t* c = saaam_create_component(rt);
+    saaam_value_t* dep = saaam_create_string(rt, "service");
+    assert(c && dep);
 
-    // Create some GC objects
-    for (int i = 0; i < 10; i++) {
-        saaam_value_t* val = saaam_alloc_value(runtime, SAAAM_TYPE_INT, SAAAM_MEMORY_GC);
-        val->data.i64 = i * 100;
-    }
+    assert(saaam_synapse_inject(rt, dep, c));
+    saaam_value_t* got = saaam_component_get_slot(c, SAAAM_TYPE_STRING);
+    assert(got == dep);
 
-    printf("After allocations: %zu objects\n", runtime->memory->gc_count);
-
-    // Run GC
-    saaam_gc_collect(runtime);
-
-    printf("After GC cycle: %zu objects\n", runtime->memory->gc_count);
-    printf("✓ Garbage collection SUCCESS!\n");
+    saaam_runtime_destroy(rt);
 }
 
-void test_performance(saaam_runtime_t* runtime) {
-    printf("\n⏱️  TEST: Performance Profiling\n");
-    printf("="*50 "\n");
+static void on_event(saaam_runtime_t* rt, void* data) {
+    (void)rt;
+    int* counter = (int*)data;
+    (*counter)++;
+}
 
-    saaam_profile_start(runtime, "1000 neuroplastic morphs");
+static void test_events(void) {
+    saaam_runtime_t* rt = saaam_runtime_init();
+    assert(rt);
 
-    for (int i = 0; i < 1000; i++) {
-        saaam_value_t* val = saaam_create_neural(runtime, SAAAM_TYPE_INT);
-        val->data.i64 = i;
+    int counter = 0;
+    assert(saaam_emit_event(rt, on_event, &counter));
+    assert(saaam_emit_event(rt, on_event, &counter));
+    size_t processed = saaam_process_events(rt);
+    assert(processed == 2);
+    assert(counter == 2);
 
-        saaam_morph_value(runtime, val, SAAAM_TYPE_FLOAT);
-        saaam_morph_value(runtime, val, SAAAM_TYPE_STRING);
-        saaam_morph_value(runtime, val, SAAAM_TYPE_BOOL);
-    }
+    saaam_runtime_destroy(rt);
+}
 
-    saaam_profile_end(runtime, "1000 neuroplastic morphs");
+static void test_gc(void) {
+    saaam_runtime_t* rt = saaam_runtime_init();
+    assert(rt);
 
-    printf("✓ Performance test SUCCESS!\n");
+    saaam_value_t* g = saaam_alloc_value(rt, SAAAM_TYPE_STRING, SAAAM_MEMORY_GC);
+    assert(g);
+    assert(g->memory_region == SAAAM_MEMORY_GC);
+    assert(g->type == SAAAM_TYPE_STRING);
+
+    assert(saaam_value_set_string(rt, g, "ephemeral"));
+    saaam_release_value(rt, g); // eligible for collection
+
+    size_t freed = saaam_gc_collect(rt);
+    assert(freed >= 1);
+
+    saaam_runtime_destroy(rt);
 }
 
 int main(void) {
-    printf("\n");
-    printf("████████████████████████████████████████████████\n");
-    printf("██                                            ██\n");
-    printf("██  SAAAM NATIVE RUNTIME TEST SUITE          ██\n");
-    printf("██  Revolutionary C/CUDA Performance Engine  ██\n");
-    printf("██                                            ██\n");
-    printf("████████████████████████████████████████████████\n");
-    printf("\n");
+    test_morphing();
+    test_binding();
+    test_flow();
+    test_inject();
+    test_events();
+    test_gc();
 
-    // Initialize runtime
-    saaam_runtime_t* runtime = saaam_runtime_init();
-    if (!runtime) {
-        fprintf(stderr, "❌ Failed to initialize runtime\n");
-        return 1;
-    }
-
-    // Run tests
-    test_neuroplastic_morphing(runtime);
-    test_ternary_logic(runtime);
-    test_memory_regions(runtime);
-    test_synapse_operators(runtime);
-    test_gc_collection(runtime);
-    test_performance(runtime);
-
-    // Print stats
-    saaam_print_performance_stats(runtime);
-
-    // Cleanup
-    saaam_runtime_destroy(runtime);
-
-    printf("\n");
-    printf("🚀 ALL TESTS PASSED! SAAAM Native Runtime is REVOLUTIONARY! 🚀\n");
-    printf("\n");
-
+    printf("OK: native runtime tests passed\n");
     return 0;
 }
+

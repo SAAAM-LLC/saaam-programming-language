@@ -22,8 +22,10 @@ extern "C" {
 #if defined(_WIN32) && !defined(SAAAM_STATIC)
   #if defined(SAAAM_BUILD_DLL)
     #define SAAAM_API __declspec(dllexport)
-  #else
+  #elif defined(SAAAM_USE_DLL)
     #define SAAAM_API __declspec(dllimport)
+  #else
+    #define SAAAM_API
   #endif
 #else
   #define SAAAM_API
@@ -198,7 +200,7 @@ SAAAM_API bool saaam_synapse_inject(saaam_runtime_t* runtime, saaam_value_t* dep
 
 // ---- GC ----
 
-SAAAM_API void saaam_gc_collect(saaam_runtime_t* runtime);
+SAAAM_API size_t saaam_gc_collect(saaam_runtime_t* runtime);
 
 // ---- Events ----
 

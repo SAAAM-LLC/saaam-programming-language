@@ -155,11 +155,12 @@ static bool vec_reserve(saaam_ptr_vec_t* v, size_t cap) {
     return true;
 }
 
-static void registry_add(saaam_ptr_vec_t* reg, saaam_value_t* v, size_t* index_field) {
-    if (!reg || !v || !index_field) return;
-    if (!vec_reserve(reg, reg->count + 1)) return;
+static bool registry_add(saaam_ptr_vec_t* reg, saaam_value_t* v, size_t* index_field) {
+    if (!reg || !v || !index_field) return false;
+    if (!vec_reserve(reg, reg->count + 1)) return false;
     *index_field = reg->count;
     reg->items[reg->count++] = v;
+    return true;
 }
 
 static void registry_remove(saaam_ptr_vec_t* reg, saaam_value_t* v, size_t* index_field, bool is_main_registry) {
@@ -540,9 +541,25 @@ saaam_value_t* saaam_alloc_value(saaam_runtime_t* rt, saaam_type_t type, saaam_m
     v->registry_index = SIZE_MAX;
     v->gc_index = SIZE_MAX;
 
-    registry_add(&rt->registry_all, v, &v->registry_index);
+    if (!registry_add(&rt->registry_all, v, &v->registry_index)) {
+        if (region == SAAAM_MEMORY_HEAP || region == SAAAM_MEMORY_GC) {
+            free(v);
+        } else if (region == SAAAM_MEMORY_STACK) {
+            pool_push(&rt->stack_pool, v);
+        } else if (region == SAAAM_MEMORY_NEURAL) {
+            pool_push(&rt->neural_pool, v);
+        } else if (region == SAAAM_MEMORY_ARENA) {
+            arena_push(rt, v);
+        }
+        return NULL;
+    }
+
     if (region == SAAAM_MEMORY_GC) {
-        registry_add(&rt->registry_gc, v, &v->gc_index);
+        if (!registry_add(&rt->registry_gc, v, &v->gc_index)) {
+            registry_remove(&rt->registry_all, v, &v->registry_index, true);
+            free(v);
+            return NULL;
+        }
     }
 
     return v;
@@ -565,10 +582,14 @@ void saaam_release_value(saaam_runtime_t* rt, saaam_value_t* v) {
     v->ref_count--;
     if (v->ref_count != 0) return;
 
-    registry_remove(&rt->registry_all, v, &v->registry_index, true);
+    // GC region is collector-owned: reaching ref_count==0 makes it eligible for collection,
+    // but we do not destroy it immediately.
     if (v->memory_region == SAAAM_MEMORY_GC) {
-        registry_remove(&rt->registry_gc, v, &v->gc_index, false);
+        return;
     }
+
+    registry_remove(&rt->registry_all, v, &v->registry_index, true);
+    // Non-GC values should never be in the GC list.
 
     value_finalize_nested(rt, v);
 
@@ -947,12 +968,13 @@ bool saaam_synapse_inject(saaam_runtime_t* rt, saaam_value_t* dependency, saaam_
     return saaam_component_set_slot(rt, target, dependency->type, dependency);
 }
 
-void saaam_gc_collect(saaam_runtime_t* rt) {
-    if (!rt) return;
+size_t saaam_gc_collect(saaam_runtime_t* rt) {
+    if (!rt) return 0;
     rt->stats.gc_cycles++;
 
     // RC-based sweep: free GC values that have been released to 0.
     // Cycles require higher-level handling (or a future cycle collector).
+    size_t freed = 0;
     size_t i = 0;
     while (i < rt->registry_gc.count) {
         saaam_value_t* v = rt->registry_gc.items[i];
@@ -961,10 +983,12 @@ void saaam_gc_collect(saaam_runtime_t* rt) {
             registry_remove(&rt->registry_gc, v, &v->gc_index, false);
             value_finalize_nested(rt, v);
             free(v);
+            freed++;
             continue;
         }
         i++;
     }
+    return freed;
 }
 
 bool saaam_emit_event(saaam_runtime_t* rt, saaam_event_handler_t handler, void* data) {

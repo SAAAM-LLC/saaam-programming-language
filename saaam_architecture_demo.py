@@ -133,8 +133,8 @@ class MultiTargetCompiler:
 
 int main() {{
     saaam_runtime_t* runtime = saaam_runtime_init();
-    runtime->enable_neuroplastic_optimization = true;
-    runtime->enable_ternary_logic = true;
+    saaam_runtime_set_neuroplastic_optimization(runtime, true);
+    saaam_runtime_set_ternary_logic(runtime, true);
     
     // Neural variables
     {self._generate_c_neural_vars(module)}
